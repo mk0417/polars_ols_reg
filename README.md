@@ -1,12 +1,26 @@
 # polars_ols_reg: High-Performance OLS Plugin for Polars
 
-A high-performance Rust expression plugin for **Polars**, implementing **Ordinary Least Squares (OLS) regression** with support for:
+This is a simple tool for running regression using **Polars**. It computes:
+
 - Point estimates (coefficients / slopes)
-- $t$-statistics and $p$-values based on Student's $t$-distribution ($df = n - k$)
-- Adjusted $R^2$ ($\text{Adj } R^2$)
-- Robust Covariance Estimators:
+- $t$-statistics and $p$-values
+- Adjusted $R^2$
+- Robust covariance estimators:
   - **White (HC0)** heteroskedasticity-consistent standard errors (default)
   - **Newey-West (HAC)** heteroskedasticity and autocorrelation consistent standard errors with user-configurable lag length (e.g., `'nw3'`)
+
+I used **Gemini 3.8 Flash (High)** to develop this package.
+
+This package might not fit your workflow as it does not ship
+comprehensive features.
+
+I probably not publish it on PyPI. Please install it from the
+available links in release page if you want to use it. For example,
+for MacOS,
+
+```
+pip install https://github.com/mk0417/polars_ols_reg/releases/download/v0.1.0/polars_ols_reg-0.1.0-cp311-abi3-macosx_11_0_arm64.whl
+```
 
 ---
 
