@@ -1,15 +1,16 @@
-# polars_ols_reg: High-Performance OLS Plugin for Polars
+# polars_ols_reg: high-performance OLS plugin for Polars
 
-This is a simple tool for running regression using **Polars**. It computes:
+This is a simple tool for running regression using **Polars**. It provides:
 
-- Point estimates (coefficients / slopes)
+- R-style expression (e.g. `y ~ x`)
+- Point estimates (coefficients)
 - $t$-statistics and $p$-values
 - Adjusted $R^2$
 - Robust covariance estimators:
-  - **White (HC0)** heteroskedasticity-consistent standard errors (default)
-  - **Newey-West (HAC)** heteroskedasticity and autocorrelation consistent standard errors with user-configurable lag length (e.g., `'nw3'`)
+  - White (HC0) heteroskedasticity-consistent standard errors (default)
+  - Newey-West (HAC) heteroskedasticity and autocorrelation consistent standard errors with user-configurable lag length (e.g. `'nw3'`)
 
-I used **Gemini 3.8 Flash (High)** to develop this package.
+I used **Antigravity CLI** + **Gemini 3.8 Flash (High)** to develop this package.
 
 This package might not fit your workflow as it does not ship
 comprehensive features.
