@@ -1,6 +1,6 @@
 [package]
 name = "polars_ols_reg"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -18,5 +18,5 @@ statrs = "0.18"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 16
+codegen-units = 1
 panic = "abort"

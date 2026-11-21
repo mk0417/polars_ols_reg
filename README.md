@@ -20,7 +20,7 @@ available links in release page if you want to use it. For example,
 for MacOS,
 
 ```
-pip install https://github.com/mk0417/polars_ols_reg/releases/download/v0.1.0/polars_ols_reg-0.1.0-cp311-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/mk0417/polars_ols_reg/releases/download/v0.2.0/polars_ols_reg-0.2.0-cp311-abi3-macosx_11_0_arm64.whl
 ```
 
 ---

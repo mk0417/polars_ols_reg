@@ -119,8 +119,15 @@ fn all_schema(input_fields: &[Field], kwargs: OlsKwargs) -> PolarsResult<Field> 
 }
 
 // ------------------------------------------------------------
-// Regression calculation
+// Core Regression Engine
 // ------------------------------------------------------------
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum OlsTarget {
+    Tvalue,
+    Pvalue,
+    All,
+}
 
 struct OlsResult {
     beta: DVector<f64>,
@@ -140,86 +147,439 @@ impl OlsResult {
     }
 }
 
-fn calculate_ols(
-    inputs: &[Series],
-    nw_lags: usize,
-) -> PolarsResult<OlsResult> {
+/// Helper to cast inputs to Float64 ChunkedArray without re-casting if already Float64
+#[inline]
+fn extract_columns(inputs: &[Series]) -> PolarsResult<Vec<Float64Chunked>> {
+    let mut columns = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        if input.dtype() == &DataType::Float64 {
+            columns.push(input.f64()?.clone());
+        } else {
+            let casted = input.cast(&DataType::Float64)?;
+            columns.push(casted.f64()?.clone());
+        }
+    }
+    Ok(columns)
+}
+
+struct ValidData {
+    n: usize,
+    k: usize,
+    y: Vec<f64>,
+    // x is stored row-major with k elements per row: [1.0, x_1, x_2, ..., x_{k-1}]
+    x: Vec<f64>,
+    xtx: DMatrix<f64>,
+    xty: DVector<f64>,
+    y_sum: f64,
+}
+
+/// Extract complete-case finite observations into flat contiguous memory.
+/// X'X, X'y, and y_sum are accumulated simultaneously in a single streaming pass.
+fn extract_valid_data(inputs: &[Series]) -> PolarsResult<Option<ValidData>> {
     if inputs.len() < 2 {
         polars_bail!(InvalidOperation:
             "OLS requires a dependent variable and at least one regressor"
         );
     }
 
-    // Cast all input series to Float64
-    let mut columns = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let casted = input.cast(&DataType::Float64)?;
-        let ca = casted.f64()?.clone();
-        columns.push(ca);
+    let columns = extract_columns(inputs)?;
+    let n_rows = inputs[0].len();
+    let k = inputs.len();
+
+    if n_rows <= k {
+        return Ok(None);
     }
 
-    let n_rows = inputs[0].len();
-    let n_cols = inputs.len(); // y + regressors -> total regressors with const = n_cols
-    let k = n_cols;
+    // Fast path: contiguous single-chunk columns without nulls
+    let is_clean = columns.iter().all(|c| c.null_count() == 0 && c.chunks().len() == 1);
 
-    // Filter complete-case finite observations (drop nulls and non-finite)
-    let mut observations: Vec<Vec<f64>> = Vec::new();
-    for i in 0..n_rows {
-        let mut row = Vec::with_capacity(n_cols);
-        let mut valid = true;
+    if is_clean {
+        let col_slices: Vec<&[f64]> = columns.iter().map(|c| c.cont_slice().unwrap()).collect();
 
-        for col in &columns {
-            match col.get(i) {
-                Some(v) if v.is_finite() => row.push(v),
-                _ => {
-                    valid = false;
+        let mut all_finite = true;
+        for s in &col_slices {
+            for &v in *s {
+                if !v.is_finite() {
+                    all_finite = false;
                     break;
+                }
+            }
+            if !all_finite {
+                break;
+            }
+        }
+
+        if all_finite {
+            let n = n_rows;
+            let mut y = Vec::with_capacity(n);
+            let mut x = Vec::with_capacity(n * k);
+            let mut xtx = DMatrix::<f64>::zeros(k, k);
+            let mut xty = DVector::<f64>::zeros(k);
+
+            xtx[(0, 0)] = n as f64;
+
+            // Intercept interactions
+            for j in 1..k {
+                let sum_xj: f64 = col_slices[j].iter().sum();
+                xtx[(0, j)] = sum_xj;
+                xtx[(j, 0)] = sum_xj;
+            }
+
+            // Regressor interactions (exploiting symmetry)
+            for i in 1..k {
+                for j in 1..=i {
+                    let dot: f64 = if i == j {
+                        col_slices[i].iter().map(|&v| v * v).sum()
+                    } else {
+                        col_slices[i].iter().zip(col_slices[j].iter()).map(|(&a, &b)| a * b).sum()
+                    };
+                    xtx[(i, j)] = dot;
+                    xtx[(j, i)] = dot;
+                }
+            }
+
+            // y interactions
+            let y_slice = col_slices[0];
+            let sum_y: f64 = y_slice.iter().sum();
+            xty[0] = sum_y;
+            let y_sum = sum_y;
+
+            for j in 1..k {
+                let dot: f64 = col_slices[j].iter().zip(y_slice.iter()).map(|(&a, &b)| a * b).sum();
+                xty[j] = dot;
+            }
+
+            // Populate contiguous flat buffers
+            for t in 0..n {
+                y.push(y_slice[t]);
+                x.push(1.0);
+                for j in 1..k {
+                    x.push(col_slices[j][t]);
+                }
+            }
+
+            return Ok(Some(ValidData {
+                n,
+                k,
+                y,
+                x,
+                xtx,
+                xty,
+                y_sum,
+            }));
+        }
+    }
+
+    // General complete-case filtering path: drops nulls and non-finite values
+    let mut y = Vec::with_capacity(n_rows);
+    let mut x = Vec::with_capacity(n_rows * k);
+    let mut xtx = DMatrix::<f64>::zeros(k, k);
+    let mut xty = DVector::<f64>::zeros(k);
+    let mut y_sum = 0.0;
+    let mut n = 0;
+
+    let mut row_buf = vec![0.0; k];
+
+    for i in 0..n_rows {
+        let mut valid = true;
+        row_buf[0] = 1.0;
+
+        let y_val = match columns[0].get(i) {
+            Some(v) if v.is_finite() => v,
+            _ => {
+                valid = false;
+                0.0
+            }
+        };
+
+        if valid {
+            for j in 1..k {
+                match columns[j].get(i) {
+                    Some(v) if v.is_finite() => row_buf[j] = v,
+                    _ => {
+                        valid = false;
+                        break;
+                    }
                 }
             }
         }
 
         if valid {
-            observations.push(row);
+            n += 1;
+            y.push(y_val);
+            y_sum += y_val;
+
+            for j in 0..k {
+                x.push(row_buf[j]);
+            }
+
+            xty[0] += y_val;
+            xtx[(0, 0)] += 1.0;
+
+            for j in 1..k {
+                let val_j = row_buf[j];
+                xtx[(0, j)] += val_j;
+                xtx[(j, 0)] += val_j;
+                xty[j] += val_j * y_val;
+            }
+
+            for j in 1..k {
+                let val_j = row_buf[j];
+                for m in 1..=j {
+                    let prod = val_j * row_buf[m];
+                    xtx[(j, m)] += prod;
+                    if j != m {
+                        xtx[(m, j)] += prod;
+                    }
+                }
+            }
         }
     }
 
-    let n = observations.len();
-
-    // Insufficient degrees of freedom for this group -> return NaNs safely
     if n <= k {
-        return Ok(OlsResult::nan(k));
+        return Ok(None);
     }
 
-    // Construct design matrix X (column 0 = 1.0 for intercept) and vector y
-    let mut x = DMatrix::<f64>::zeros(n, k);
-    let mut y = DVector::<f64>::zeros(n);
+    Ok(Some(ValidData {
+        n,
+        k,
+        y,
+        x,
+        xtx,
+        xty,
+        y_sum,
+    }))
+}
 
-    for i in 0..n {
-        x[(i, 0)] = 1.0;
-        y[i] = observations[i][0];
+// ------------------------------------------------------------
+// Specialized High-Performance Solvers
+// ------------------------------------------------------------
 
-        for j in 1..k {
-            x[(i, j)] = observations[i][j];
+/// Fast solver for regression coefficients only: computes (X'X)^(-1) X'y with zero
+/// residual/meat/distribution overhead and zero intermediate heap allocations.
+fn calculate_coeff(inputs: &[Series]) -> PolarsResult<Vec<f64>> {
+    if inputs.len() < 2 {
+        polars_bail!(InvalidOperation:
+            "OLS requires a dependent variable and at least one regressor"
+        );
+    }
+
+    let columns = extract_columns(inputs)?;
+    let n_rows = inputs[0].len();
+    let k = inputs.len();
+
+    if n_rows <= k {
+        return Ok(vec![f64::NAN; k]);
+    }
+
+    let is_clean = columns.iter().all(|c| c.null_count() == 0 && c.chunks().len() == 1);
+
+    if is_clean {
+        let col_slices: Vec<&[f64]> = columns.iter().map(|c| c.cont_slice().unwrap()).collect();
+
+        let mut all_finite = true;
+        for s in &col_slices {
+            for &v in *s {
+                if !v.is_finite() {
+                    all_finite = false;
+                    break;
+                }
+            }
+            if !all_finite {
+                break;
+            }
+        }
+
+        if all_finite {
+            let n = n_rows;
+            let mut xtx = DMatrix::<f64>::zeros(k, k);
+            let mut xty = DVector::<f64>::zeros(k);
+
+            xtx[(0, 0)] = n as f64;
+
+            for j in 1..k {
+                let sum_xj: f64 = col_slices[j].iter().sum();
+                xtx[(0, j)] = sum_xj;
+                xtx[(j, 0)] = sum_xj;
+            }
+
+            for i in 1..k {
+                for j in 1..=i {
+                    let dot: f64 = if i == j {
+                        col_slices[i].iter().map(|&v| v * v).sum()
+                    } else {
+                        col_slices[i].iter().zip(col_slices[j].iter()).map(|(&a, &b)| a * b).sum()
+                    };
+                    xtx[(i, j)] = dot;
+                    xtx[(j, i)] = dot;
+                }
+            }
+
+            let y_slice = col_slices[0];
+            xty[0] = y_slice.iter().sum();
+
+            for j in 1..k {
+                xty[j] = col_slices[j].iter().zip(y_slice.iter()).map(|(&a, &b)| a * b).sum();
+            }
+
+            let bread = match xtx.try_inverse() {
+                Some(inv) => inv,
+                None => return Ok(vec![f64::NAN; k]),
+            };
+
+            let beta = bread * xty;
+            return Ok(beta.iter().copied().collect());
         }
     }
 
-    // OLS normal equations
-    let xtx = x.transpose() * &x;
-    let xty = x.transpose() * &y;
+    // Streaming accumulator: zero heap allocations for data points
+    let mut xtx = DMatrix::<f64>::zeros(k, k);
+    let mut xty = DVector::<f64>::zeros(k);
+    let mut n = 0;
+    let mut row_buf = vec![0.0; k];
 
-    // Bread matrix (X'X)^(-1)
+    for i in 0..n_rows {
+        let mut valid = true;
+        row_buf[0] = 1.0;
+
+        let y_val = match columns[0].get(i) {
+            Some(v) if v.is_finite() => v,
+            _ => {
+                valid = false;
+                0.0
+            }
+        };
+
+        if valid {
+            for j in 1..k {
+                match columns[j].get(i) {
+                    Some(v) if v.is_finite() => row_buf[j] = v,
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if valid {
+            n += 1;
+            xty[0] += y_val;
+            xtx[(0, 0)] += 1.0;
+
+            for j in 1..k {
+                let val_j = row_buf[j];
+                xtx[(0, j)] += val_j;
+                xtx[(j, 0)] += val_j;
+                xty[j] += val_j * y_val;
+            }
+
+            for j in 1..k {
+                let val_j = row_buf[j];
+                for m in 1..=j {
+                    let prod = val_j * row_buf[m];
+                    xtx[(j, m)] += prod;
+                    if j != m {
+                        xtx[(m, j)] += prod;
+                    }
+                }
+            }
+        }
+    }
+
+    if n <= k {
+        return Ok(vec![f64::NAN; k]);
+    }
+
     let bread = match xtx.try_inverse() {
         Some(inv) => inv,
-        None => return Ok(OlsResult::nan(k)), // Singular design matrix (collinear regressors)
+        None => return Ok(vec![f64::NAN; k]),
     };
 
-    let beta = &bread * xty;
-    let residuals = &y - &x * &beta;
+    let beta = bread * xty;
+    Ok(beta.iter().copied().collect())
+}
 
-    // R-squared and Adjusted R-squared
-    let y_mean = y.iter().sum::<f64>() / n as f64;
-    let tss: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let rss: f64 = residuals.iter().map(|v| v.powi(2)).sum();
+/// Fast solver for Adjusted R-squared: skips sandwich covariance and p-value distribution
+fn calculate_adjr2(inputs: &[Series]) -> PolarsResult<f64> {
+    let data = match extract_valid_data(inputs)? {
+        Some(d) => d,
+        None => return Ok(f64::NAN),
+    };
+    let n = data.n;
+    let k = data.k;
+
+    let bread = match data.xtx.try_inverse() {
+        Some(inv) => inv,
+        None => return Ok(f64::NAN),
+    };
+    let beta = &bread * &data.xty;
+
+    let y_mean = data.y_sum / n as f64;
+    let mut rss = 0.0;
+    let mut tss = 0.0;
+
+    for t in 0..n {
+        let y_t = data.y[t];
+        let x_row = &data.x[t * k..(t + 1) * k];
+        let mut y_hat = 0.0;
+        for j in 0..k {
+            y_hat += x_row[j] * beta[j];
+        }
+        let e = y_t - y_hat;
+        rss += e * e;
+        let dy = y_t - y_mean;
+        tss += dy * dy;
+    }
+
+    if tss <= 0.0 || !tss.is_finite() {
+        Ok(f64::NAN)
+    } else {
+        let r2 = 1.0 - rss / tss;
+        let adjr2 = 1.0 - (1.0 - r2) * (n - 1) as f64 / (n - k) as f64;
+        Ok(adjr2)
+    }
+}
+
+/// Full robust regression solver for White (HC0) and Newey-West (HAC) standard errors.
+/// Uses in-place outer products and symmetric updates with zero per-row heap allocations.
+fn calculate_ols_robust(
+    inputs: &[Series],
+    nw_lags: usize,
+    target: OlsTarget,
+) -> PolarsResult<OlsResult> {
+    let data = match extract_valid_data(inputs)? {
+        Some(d) => d,
+        None => return Ok(OlsResult::nan(inputs.len())),
+    };
+    let n = data.n;
+    let k = data.k;
+
+    let bread = match data.xtx.try_inverse() {
+        Some(inv) => inv,
+        None => return Ok(OlsResult::nan(k)),
+    };
+    let beta = &bread * &data.xty;
+
+    // Compute residuals, RSS, TSS
+    let y_mean = data.y_sum / n as f64;
+    let mut residuals = Vec::with_capacity(n);
+    let mut rss = 0.0;
+    let mut tss = 0.0;
+
+    for t in 0..n {
+        let y_t = data.y[t];
+        let x_row = &data.x[t * k..(t + 1) * k];
+        let mut y_hat = 0.0;
+        for j in 0..k {
+            y_hat += x_row[j] * beta[j];
+        }
+        let e = y_t - y_hat;
+        residuals.push(e);
+        rss += e * e;
+        let dy = y_t - y_mean;
+        tss += dy * dy;
+    }
 
     let adjr2 = if tss <= 0.0 || !tss.is_finite() {
         f64::NAN
@@ -228,36 +588,73 @@ fn calculate_ols(
         1.0 - (1.0 - r2) * (n - 1) as f64 / (n - k) as f64
     };
 
-    // Precalculate scores S_t = e_t * x_t (for White and Newey-West)
-    let mut scores: Vec<DVector<f64>> = Vec::with_capacity(n);
-    for t in 0..n {
-        let e = residuals[t];
-        let mut st = DVector::<f64>::zeros(k);
-        for j in 0..k {
-            st[j] = x[(t, j)] * e;
-        }
-        scores.push(st);
-    }
-
-    // Meat matrix S: contemporaneous covariance S_0 (White HC0)
     let mut meat = DMatrix::<f64>::zeros(k, k);
-    for t in 0..n {
-        let st = &scores[t];
-        meat += st * st.transpose();
-    }
 
-    // Newey-West Bartlett kernel lagged covariance
-    if nw_lags > 0 {
+    if nw_lags == 0 {
+        // White HC0 contemporaneous meat matrix: accumulated in-place without storing scores
+        for t in 0..n {
+            let e = residuals[t];
+            let x_row = &data.x[t * k..(t + 1) * k];
+            for i in 0..k {
+                let s_i = e * x_row[i];
+                for j in 0..=i {
+                    let prod = s_i * (e * x_row[j]);
+                    meat[(i, j)] += prod;
+                    if i != j {
+                        meat[(j, i)] += prod;
+                    }
+                }
+            }
+        }
+    } else {
+        // Newey-West HAC: store scores in single flat contiguous buffer of length n * k
+        let mut scores = Vec::with_capacity(n * k);
+        for t in 0..n {
+            let e = residuals[t];
+            let x_row = &data.x[t * k..(t + 1) * k];
+            for j in 0..k {
+                scores.push(e * x_row[j]);
+            }
+        }
+
+        // Contemporaneous S_0
+        for t in 0..n {
+            let cur = &scores[t * k..(t + 1) * k];
+            for i in 0..k {
+                let cur_i = cur[i];
+                for j in 0..=i {
+                    let prod = cur_i * cur[j];
+                    meat[(i, j)] += prod;
+                    if i != j {
+                        meat[(j, i)] += prod;
+                    }
+                }
+            }
+        }
+
+        // Bartlett kernel lagged covariance: accumulated in-place with zero temporary heap matrices
         let max_lag = nw_lags.min(n.saturating_sub(1));
         for lag in 1..=max_lag {
             let weight = 1.0 - (lag as f64) / ((nw_lags + 1) as f64);
             let mut gamma = DMatrix::<f64>::zeros(k, k);
+
             for t in lag..n {
-                let cur = &scores[t];
-                let prev = &scores[t - lag];
-                gamma += cur * prev.transpose();
+                let cur = &scores[t * k..(t + 1) * k];
+                let prev = &scores[(t - lag) * k..((t - lag) + 1) * k];
+
+                for i in 0..k {
+                    let cur_i = cur[i];
+                    for j in 0..k {
+                        gamma[(i, j)] += cur_i * prev[j];
+                    }
+                }
             }
-            meat += weight * (&gamma + gamma.transpose());
+
+            for i in 0..k {
+                for j in 0..k {
+                    meat[(i, j)] += weight * (gamma[(i, j)] + gamma[(j, i)]);
+                }
+            }
         }
     }
 
@@ -265,9 +662,13 @@ fn calculate_ols(
     let covariance = &bread * meat * &bread;
 
     let df = (n - k) as f64;
-    let student_t = match StudentsT::new(0.0, 1.0, df) {
-        Ok(dist) => dist,
-        Err(_) => return Ok(OlsResult::nan(k)),
+    let student_t = if target == OlsTarget::Pvalue || target == OlsTarget::All {
+        match StudentsT::new(0.0, 1.0, df) {
+            Ok(dist) => Some(dist),
+            Err(_) => return Ok(OlsResult::nan(k)),
+        }
+    } else {
+        None
     };
 
     let mut tvalue = DVector::<f64>::zeros(k);
@@ -284,11 +685,15 @@ fn calculate_ols(
             let t = beta[j] / se;
             tvalue[j] = t;
 
-            if t.is_nan() {
-                pvalue[j] = f64::NAN;
+            if let Some(ref dist) = student_t {
+                if t.is_nan() {
+                    pvalue[j] = f64::NAN;
+                } else {
+                    let p = 2.0 * (1.0 - dist.cdf(t.abs()));
+                    pvalue[j] = p.clamp(0.0, 1.0);
+                }
             } else {
-                let p = 2.0 * (1.0 - student_t.cdf(t.abs()));
-                pvalue[j] = p.clamp(0.0, 1.0);
+                pvalue[j] = f64::NAN;
             }
         }
     }
@@ -353,37 +758,37 @@ fn result_to_struct(
 
 #[polars_expr(output_type_func_with_kwargs=coeff_schema)]
 fn ols_coeff(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
-    let result = calculate_ols(inputs, kwargs.nw_lags)?;
-    let values: Vec<f64> = result.beta.iter().copied().collect();
+    let values = calculate_coeff(inputs)?;
     result_to_struct(inputs, &kwargs.names, &values, "b_")
 }
 
 #[polars_expr(output_type_func_with_kwargs=tvalue_schema)]
 fn ols_tvalue(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
-    let result = calculate_ols(inputs, kwargs.nw_lags)?;
+    let result = calculate_ols_robust(inputs, kwargs.nw_lags, OlsTarget::Tvalue)?;
     let values: Vec<f64> = result.tvalue.iter().copied().collect();
     result_to_struct(inputs, &kwargs.names, &values, "t_")
 }
 
 #[polars_expr(output_type_func_with_kwargs=pvalue_schema)]
 fn ols_pvalue(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
-    let result = calculate_ols(inputs, kwargs.nw_lags)?;
+    let result = calculate_ols_robust(inputs, kwargs.nw_lags, OlsTarget::Pvalue)?;
     let values: Vec<f64> = result.pvalue.iter().copied().collect();
     result_to_struct(inputs, &kwargs.names, &values, "p_")
 }
 
 #[polars_expr(output_type=Float64)]
 fn ols_adjr2(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
-    let result = calculate_ols(inputs, kwargs.nw_lags)?;
+    let _ = kwargs;
+    let adjr2 = calculate_adjr2(inputs)?;
     Ok(Series::new(
         "adjr2".into(),
-        &[result.adjr2],
+        &[adjr2],
     ))
 }
 
 #[polars_expr(output_type_func_with_kwargs=all_schema)]
 fn ols_all(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
-    let result = calculate_ols(inputs, kwargs.nw_lags)?;
+    let result = calculate_ols_robust(inputs, kwargs.nw_lags, OlsTarget::All)?;
 
     let k = result.beta.len();
     let names: Vec<String> = if !kwargs.names.is_empty() {
