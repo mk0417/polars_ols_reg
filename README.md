@@ -33,52 +33,41 @@ from polars_ols_reg import ols_reg
 
 # Sample panel DataFrame
 df = pl.DataFrame({
-    "var": ["A"] * 50 + ["B"] * 50,
-    "x1": [float(i % 10) for i in range(100)],
-    "x2": [float((i * 3) % 7) for i in range(100)],
-    "y": [1.5 + 2.0 * (i % 10) - 0.8 * ((i * 3) % 7) + 0.1 * (i % 5) for i in range(100)],
-})
+    'var': ['A']*50+['B']*50,
+    'x1': [float(i%10) for i in range(100)],
+    'x2': [float((i*3)%7) for i in range(100)],
+    'y': [1.5+2*(i%10)-0.8*((i*3)%7)+0.1*(i%5) for i in range(100)]})
 ```
 
 ### 1) Default Behavior: Returns Everything
 If the 3rd parameter is ignored, the plugin returns **all** statistics at once:
 ```python
-df.group_by('var').agg(
-    est=ols_reg('y ~ x1+x2', 'nw3')
-).unnest('est')
+df.group_by('var').agg(est=ols_reg('y ~ x1+x2', 'nw3')).unnest('est')
 ```
 **Output columns:**
 `var`, `b_const`, `b_x1`, `b_x2`, `t_const`, `t_x1`, `t_x2`, `p_const`, `p_x1`, `p_x2`, `adjr2`
 
 ### 2) Only Estimated Coefficients
 ```python
-df.group_by('var').agg(
-    est=ols_reg('y ~ x1+x2', 'nw3', 'coeff')
-).unnest('est')
+df.group_by('var').agg(est=ols_reg('y ~ x1+x2', 'nw3', 'coeff')).unnest('est')
 ```
 **Output columns:** `var`, `b_const`, `b_x1`, `b_x2`
 
 ### 3) Only $t$-values
 ```python
-df.group_by('var').agg(
-    est=ols_reg('y ~ x1+x2', 'nw3', 'tvalue')
-).unnest('est')
+df.group_by('var').agg(est=ols_reg('y ~ x1+x2', 'nw3', 'tvalue')).unnest('est')
 ```
 **Output columns:** `var`, `t_const`, `t_x1`, `t_x2`
 
 ### 4) Only $p$-values
 ```python
-df.group_by('var').agg(
-    est=ols_reg('y ~ x1+x2', 'white', 'pvalue')
-).unnest('est')
+df.group_by('var').agg(est=ols_reg('y ~ x1+x2', 'white', 'pvalue')).unnest('est')
 ```
 **Output columns:** `var`, `p_const`, `p_x1`, `p_x2`
 
 ### 5) Only Adjusted $R^2$
 ```python
-df.group_by('var').agg(
-    adjr2=ols_reg('y ~ x1+x2', 'nw3', 'adjr2')
-)
+df.group_by('var').agg(adjr2=ols_reg('y ~ x1+x2', 'nw3', 'adjr2'))
 ```
 **Output columns:** `var`, `adjr2`
 
@@ -89,8 +78,8 @@ df.group_by('var').agg(
 ```python
 ols_reg(
     formula: str,
-    cov_type: str = "white",
-    result: str = "all",
+    cov_type: str = 'white',
+    result: str = 'all',
 ) -> pl.Expr
 ```
 
@@ -106,7 +95,7 @@ ols_reg(
   - `'coeff'` (aliases: `'beta'`, `'slopes'`): Returns struct with fields `b_const, b_x1, b_x2, ...`
   - `'tvalue'` (aliases: `'t'`, `'tstat'`): Returns struct with fields `t_const, t_x1, t_x2, ...`
   - `'pvalue'` (aliases: `'p'`, `'pval'`): Returns struct with fields `p_const, p_x1, p_x2, ...`
-  - `'adjr2'` (aliases: `'r2'`): Returns scalar `Float64` column with adjusted $R^2$.
+  - `'adjr2'` (aliases: `'r2'`): Returns scalar with adjusted $R^2$.
 
 ---
 
