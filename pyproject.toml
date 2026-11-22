@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "polars_ols_reg"
-version = "0.2.0"
+version = "0.3.0"
 description = "Polars Rust expression plugin for OLS regression with White and Newey-West standard errors"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -1,4 +1,4 @@
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{Cholesky, DMatrix, DVector};
 use polars::prelude::*;
 use pyo3::prelude::*;
 use pyo3_polars::derive::polars_expr;
@@ -422,12 +422,13 @@ fn calculate_coeff(inputs: &[Series]) -> PolarsResult<Vec<f64>> {
                 xty[j] = col_slices[j].iter().zip(y_slice.iter()).map(|(&a, &b)| a * b).sum();
             }
 
-            let bread = match xtx.try_inverse() {
-                Some(inv) => inv,
-                None => return Ok(vec![f64::NAN; k]),
+            let beta = match Cholesky::new(xtx.clone()) {
+                Some(chol) => chol.solve(&xty),
+                None => match xtx.try_inverse() {
+                    Some(inv) => inv * xty,
+                    None => return Ok(vec![f64::NAN; k]),
+                },
             };
-
-            let beta = bread * xty;
             return Ok(beta.iter().copied().collect());
         }
     }
@@ -491,12 +492,14 @@ fn calculate_coeff(inputs: &[Series]) -> PolarsResult<Vec<f64>> {
         return Ok(vec![f64::NAN; k]);
     }
 
-    let bread = match xtx.try_inverse() {
-        Some(inv) => inv,
-        None => return Ok(vec![f64::NAN; k]),
+    let beta = match Cholesky::new(xtx.clone()) {
+        Some(chol) => chol.solve(&xty),
+        None => match xtx.try_inverse() {
+            Some(inv) => inv * xty,
+            None => return Ok(vec![f64::NAN; k]),
+        },
     };
 
-    let beta = bread * xty;
     Ok(beta.iter().copied().collect())
 }
 
@@ -509,11 +512,13 @@ fn calculate_adjr2(inputs: &[Series]) -> PolarsResult<f64> {
     let n = data.n;
     let k = data.k;
 
-    let bread = match data.xtx.try_inverse() {
-        Some(inv) => inv,
-        None => return Ok(f64::NAN),
+    let beta = match Cholesky::new(data.xtx.clone()) {
+        Some(chol) => chol.solve(&data.xty),
+        None => match data.xtx.try_inverse() {
+            Some(inv) => &inv * &data.xty,
+            None => return Ok(f64::NAN),
+        },
     };
-    let beta = &bread * &data.xty;
 
     let y_mean = data.y_sum / n as f64;
     let mut rss = 0.0;
@@ -555,9 +560,12 @@ fn calculate_ols_robust(
     let n = data.n;
     let k = data.k;
 
-    let bread = match data.xtx.try_inverse() {
-        Some(inv) => inv,
-        None => return Ok(OlsResult::nan(k)),
+    let bread = match Cholesky::new(data.xtx.clone()) {
+        Some(chol) => chol.inverse(),
+        None => match data.xtx.try_inverse() {
+            Some(inv) => inv,
+            None => return Ok(OlsResult::nan(k)),
+        },
     };
     let beta = &bread * &data.xty;
 
@@ -632,27 +640,37 @@ fn calculate_ols_robust(
             }
         }
 
-        // Bartlett kernel lagged covariance: accumulated in-place with zero temporary heap matrices
+        // Bartlett kernel lagged covariance: accumulated using a single scratch buffer
+        // with zero heap allocations inside the lag loop.
         let max_lag = nw_lags.min(n.saturating_sub(1));
-        for lag in 1..=max_lag {
-            let weight = 1.0 - (lag as f64) / ((nw_lags + 1) as f64);
-            let mut gamma = DMatrix::<f64>::zeros(k, k);
+        if max_lag > 0 {
+            let mut gamma_buf = vec![0.0; k * k];
+            for lag in 1..=max_lag {
+                gamma_buf.fill(0.0);
+                let weight = 1.0 - (lag as f64) / ((nw_lags + 1) as f64);
 
-            for t in lag..n {
-                let cur = &scores[t * k..(t + 1) * k];
-                let prev = &scores[(t - lag) * k..((t - lag) + 1) * k];
+                for t in lag..n {
+                    let cur = &scores[t * k..(t + 1) * k];
+                    let prev = &scores[(t - lag) * k..((t - lag) + 1) * k];
 
-                for i in 0..k {
-                    let cur_i = cur[i];
-                    for j in 0..k {
-                        gamma[(i, j)] += cur_i * prev[j];
+                    for i in 0..k {
+                        let cur_i = cur[i];
+                        let offset_i = i * k;
+                        for j in 0..k {
+                            gamma_buf[offset_i + j] += cur_i * prev[j];
+                        }
                     }
                 }
-            }
 
-            for i in 0..k {
-                for j in 0..k {
-                    meat[(i, j)] += weight * (gamma[(i, j)] + gamma[(j, i)]);
+                for i in 0..k {
+                    let offset_i = i * k;
+                    for j in 0..=i {
+                        let prod = weight * (gamma_buf[offset_i + j] + gamma_buf[j * k + i]);
+                        meat[(i, j)] += prod;
+                        if i != j {
+                            meat[(j, i)] += prod;
+                        }
+                    }
                 }
             }
         }
@@ -719,32 +737,32 @@ fn result_to_struct(
     let mut fields = Vec::with_capacity(values.len());
 
     // Intercept (const)
-    fields.push(Series::new(
-        format!("{prefix}const").into(),
-        &[values[0]],
-    ));
+    let const_name = match prefix {
+        "b_" => PlSmallStr::from_static("b_const"),
+        "t_" => PlSmallStr::from_static("t_const"),
+        "p_" => PlSmallStr::from_static("p_const"),
+        _ => format!("{prefix}const").into(),
+    };
+    fields.push(Series::new(const_name, &[values[0]]));
 
     // Regressor coefficients / statistics
     for j in 1..values.len() {
-        let col_name = if j - 1 < names.len() {
-            names[j - 1].clone()
+        let col_name: PlSmallStr = if j - 1 < names.len() {
+            format!("{prefix}{}", names[j - 1]).into()
         } else {
             let in_name = inputs[j].name();
             if in_name.is_empty() {
-                format!("x{j}")
+                format!("{prefix}x{j}").into()
             } else {
-                in_name.to_string()
+                format!("{prefix}{in_name}").into()
             }
         };
 
-        fields.push(Series::new(
-            format!("{prefix}{col_name}").into(),
-            &[values[j]],
-        ));
+        fields.push(Series::new(col_name, &[values[j]]));
     }
 
     let struct_ca = StructChunked::from_series(
-        "ols".into(),
+        PlSmallStr::from_static("ols"),
         1,
         fields.iter(),
     )?;
@@ -781,7 +799,7 @@ fn ols_adjr2(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
     let _ = kwargs;
     let adjr2 = calculate_adjr2(inputs)?;
     Ok(Series::new(
-        "adjr2".into(),
+        PlSmallStr::from_static("adjr2"),
         &[adjr2],
     ))
 }
@@ -808,31 +826,31 @@ fn ols_all(inputs: &[Series], kwargs: OlsKwargs) -> PolarsResult<Series> {
     let mut fields = Vec::with_capacity(total_fields);
 
     // 1. Coefficients: b_const, b_<name>
-    fields.push(Series::new("b_const".into(), &[result.beta[0]]));
-    for j in 1..k {
-        let col_name = if j - 1 < names.len() { &names[j - 1] } else { "x" };
-        fields.push(Series::new(format!("b_{col_name}").into(), &[result.beta[j]]));
+    fields.push(Series::new(PlSmallStr::from_static("b_const"), &[result.beta[0]]));
+    for (j, name) in names.iter().enumerate() {
+        let col_name: PlSmallStr = format!("b_{name}").into();
+        fields.push(Series::new(col_name, &[result.beta[j + 1]]));
     }
 
     // 2. t-values: t_const, t_<name>
-    fields.push(Series::new("t_const".into(), &[result.tvalue[0]]));
-    for j in 1..k {
-        let col_name = if j - 1 < names.len() { &names[j - 1] } else { "x" };
-        fields.push(Series::new(format!("t_{col_name}").into(), &[result.tvalue[j]]));
+    fields.push(Series::new(PlSmallStr::from_static("t_const"), &[result.tvalue[0]]));
+    for (j, name) in names.iter().enumerate() {
+        let col_name: PlSmallStr = format!("t_{name}").into();
+        fields.push(Series::new(col_name, &[result.tvalue[j + 1]]));
     }
 
     // 3. p-values: p_const, p_<name>
-    fields.push(Series::new("p_const".into(), &[result.pvalue[0]]));
-    for j in 1..k {
-        let col_name = if j - 1 < names.len() { &names[j - 1] } else { "x" };
-        fields.push(Series::new(format!("p_{col_name}").into(), &[result.pvalue[j]]));
+    fields.push(Series::new(PlSmallStr::from_static("p_const"), &[result.pvalue[0]]));
+    for (j, name) in names.iter().enumerate() {
+        let col_name: PlSmallStr = format!("p_{name}").into();
+        fields.push(Series::new(col_name, &[result.pvalue[j + 1]]));
     }
 
     // 4. Adjusted R-squared: adjr2
-    fields.push(Series::new("adjr2".into(), &[result.adjr2]));
+    fields.push(Series::new(PlSmallStr::from_static("adjr2"), &[result.adjr2]));
 
     let struct_ca = StructChunked::from_series(
-        "ols".into(),
+        PlSmallStr::from_static("ols"),
         1,
         fields.iter(),
     )?;

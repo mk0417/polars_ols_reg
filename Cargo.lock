@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "polars_ols_reg"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nalgebra 0.34.2",
  "polars",

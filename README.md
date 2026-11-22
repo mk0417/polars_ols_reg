@@ -9,6 +9,7 @@ This is a simple tool for running regression using **Polars**. It provides:
 - Robust covariance estimators:
   - White (HC0) heteroskedasticity-consistent standard errors (default)
   - Newey-West (HAC) heteroskedasticity and autocorrelation consistent standard errors with user-configurable lag length (e.g. `'nw3'`)
+- High-performance multi-threaded parallel regressions across large numbers of groups (`ols_reg_group_parallel`)
 
 I used **Antigravity CLI** + **Gemini 3.8 Flash (High)** to develop this package.
 
@@ -20,7 +21,7 @@ available links in release page if you want to use it. For example,
 for MacOS,
 
 ```
-pip install https://github.com/mk0417/polars_ols_reg/releases/download/v0.2.0/polars_ols_reg-0.2.0-cp311-abi3-macosx_11_0_arm64.whl
+pip install https://github.com/mk0417/polars_ols_reg/releases/download/v0.3.0/polars_ols_reg-0.3.0-cp311-abi3-macosx_11_0_arm64.whl
 ```
 
 ---
@@ -99,3 +100,29 @@ ols_reg(
 
 ---
 
+## 3. High-Performance Multi-Core Parallel Regressions: `ols_reg_group_parallel`
+
+For panel datasets with a large number of groups, Polars evaluates custom plugin expressions sequentially when using standard `df.group_by().agg()`. 
+
+To achieve **linear multi-core parallel scaling (3x – 8x faster)** across all CPU cores, use `ols_reg_group_parallel`:
+
+```python
+from polars_ols_reg import ols_reg_group_parallel
+
+# 1. Single group variable (uses all CPU cores by default)
+res = ols_reg_group_parallel(df, by='var', formula='y ~ x1 + x2', cov_type='nw3')
+
+# 2. Multiple group variables (e.g. firm and year)
+res = ols_reg_group_parallel(df, by=['firm', 'year'], formula='y ~ x1 + x2', cov_type='white', result='coeff')
+
+# 3. Explicitly set number of threads
+res = ols_reg_group_parallel(df, by='var', formula='y ~ x1 + x2', n_threads=16)
+```
+
+### Parameters:
+- **`df`** (`pl.DataFrame`): Input Polars DataFrame.
+- **`by`** (`str | Sequence[str]`): Column name or list of column names to group by.
+- **`formula`** (`str`): Regression formula (e.g. `'y ~ x1 + x2'`).
+- **`cov_type`** (`str`, default: `'white'`): `'white'` or `'nw+N'` (e.g. `'nw3'`).
+- **`result`** (`str`, default: `'all'`): `'all'`, `'coeff'`, `'tvalue'`, `'pvalue'`, or `'adjr2'`.
+- **`n_threads`** (`int`, optional): Number of worker threads. Defaults to `pl.thread_pool_size()`.
